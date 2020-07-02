@@ -138,20 +138,6 @@ static int win_result(void)
 static int controller_busy(void);
 static int status_ok(void);
 
-static int controller_ready(unsigned int drive, unsigned int head)
-{
-	int retry = 100;
-
-	do {
-		if (controller_busy() & BUSY_STAT)
-			return 0;
-		outb_p(0xA0 | (drive<<4) | head, HD_CURRENT);
-		if (status_ok())
-			return 1;
-	} while (--retry);
-	return 0;
-}
-
 static int status_ok(void)
 {
 	unsigned char status = inb_p(HD_STATUS);
@@ -183,19 +169,64 @@ static void hd_out(unsigned int drive,unsigned int nsect,unsigned int sect,
 		void (*intr_addr)(void))
 {
 	unsigned short port;
-
-	if (drive>1 || head>15)
-		panic("Trying to write bad sector");
+	unsigned int lba_address;
 #if (HD_DELAY > 0)
 	while (read_timer() - last_req < HD_DELAY)
 		/* nothing */;
 #endif
 	if (reset)
 		return;
-	if (!controller_ready(drive, head)) {
-		reset = 1;
-		return;
-	}
+
+	/* FIXME: Support second HDD */
+
+	/**
+	 * We need to convert the CHS address to a LHA one
+	 */
+
+	lba_address = ((cyl * hd_info[drive].head) + head) * hd_info[drive].sect
+	 + (sect - 1);
+
+#if 0
+	printk("LBA Address: 0x%x\n", lba_address);
+	printk("CHS Address: nsect: %d, sect: %d, cyl: %d, head: %d\n", nsect, sect, cyl, head);
+#endif
+
+	/**
+	 * 28-bit PIO
+	 * Send 0xE0 for the "master" or 0xF0 for the "slave", ORed with the highest 4 bits of the LBA to port 0x1F6: outb(0x1F6, 0xE0 | (slavebit << 4) | ((LBA >> 24) & 0x0F))
+	 * Send a NULL byte to port 0x1F1, if you like (it is ignored and wastes lots of CPU time): outb(0x1F1, 0x00)
+	 * Send the sectorcount to port 0x1F2: outb(0x1F2, (unsigned char) count)
+     * Send the low 8 bits of the LBA to port 0x1F3: outb(0x1F3, (unsigned char) LBA))
+     * Send the next 8 bits of the LBA to port 0x1F4: outb(0x1F4, (unsigned char)(LBA >> 8))
+     * Send the next 8 bits of the LBA to port 0x1F5: outb(0x1F5, (unsigned char)(LBA >> 16))
+     * Send the "READ SECTORS" command (0x20) to port 0x1F7: outb(0x1F7, 0x20)
+     * Wait for an IRQ or poll.
+     * Transfer 256 16-bit values, a uint16_t at a time, into your buffer from I/O port 0x1F0. (In assembler, REP INSW works well for this.)
+     * Then loop back to waiting for the next IRQ (or poll again -- see next note) for each successive sector.
+     *
+	 * CHS Address Mode:
+	 * Send 0xA0 for the "master" or 0xB0 for the "slave", ORed with the Head Number to port 0x1F6: outb(0x1F6, 0xA0 | (slavebit << 4) | Head Number)
+	 * outb (0x1F2, bytecount/512 = sectorcount)
+     * outb (0x1F3, Sector Number -- the S in CHS)
+     * outb (0x1F4, Cylinder Low Byte)
+     * outb (0x1F5, Cylinder High Byte)
+     * Send the "READ SECTORS" command (0x20) to port 0x1F7: outb(0x1F7, 0x20)
+	 */
+
+	SET_INTR(intr_addr);
+	outb_p(hd_info[drive].ctl,HD_CMD);
+	port=HD_DATA;
+	outb_p(hd_info[drive].wpcom>>2,++port);
+	outb_p(nsect,++port);
+	outb_p(lba_address,++port);
+	outb_p(lba_address>>8,++port);
+	outb_p(lba_address>>16,++port);
+
+	/* Set Drive Ident in PIO LBA 28 */
+	outb_p(0xE0 | ((lba_address >> 24)), ++port);
+	outb_p(cmd,++port);
+
+#if 0
 	SET_INTR(intr_addr);
 	outb_p(hd_info[drive].ctl,HD_CMD);
 	port=HD_DATA;
@@ -206,6 +237,7 @@ static void hd_out(unsigned int drive,unsigned int nsect,unsigned int sect,
 	outb_p(cyl>>8,++port);
 	outb_p(0xA0|(drive<<4)|head,++port);
 	outb_p(cmd,++port);
+#endif /* Original CHS code */
 }
 
 static int drive_busy(void)
@@ -683,17 +715,7 @@ static void hd_geninit(void)
 	i = NR_HD;
 	while (i-- > 0) {
 		hd[i<<6].nr_sects = 0;
-		if (hd_info[i].head > 16) {
-			printk("hd.c: ST-506 interface disk with more than 16 heads detected,\n");
-			printk("  probably due to non-standard sector translation. Giving up.\n");
-			printk("  (disk %d: cyl=%d, sect=%d, head=%d)\n", i,
-				hd_info[i].cyl,
-				hd_info[i].sect,
-				hd_info[i].head);
-			if (i+1 == NR_HD)
-				NR_HD--;
-			continue;
-		}
+
 		hd[i<<6].nr_sects = hd_info[i].head*
 				hd_info[i].sect*hd_info[i].cyl;
 	}
